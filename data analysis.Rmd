@@ -1,0 +1,583 @@
+---
+title: "Eye tracking Data Analysis"
+output: html_notebook
+---
+
+```{r library used}
+library(tidyverse)
+library(jpeg)  
+library(gridExtra)
+library(ggpubr)
+require(magick)
+library(timeDate)
+library(spatstat)
+library(magrittr)
+library(scanpath)
+library(gazer)
+library(dtw)
+library(wavelets)
+library(party)
+library(caTools)
+library(caret)
+library(e1071)
+library(AUC)
+library(glmnet)
+library(pROC)
+library(ROCR)
+library(scatterplot3d)
+```
+
+```{r Define the 5 blocks}
+# Define the 5 blocks for the whole video
+BlockDef <- data.frame(
+  VIDEO_FRAME_INDEX = c(2:1198),
+  BLOCK = c(rep(1,159), rep(2,190), rep(3,475), rep(4, 136), rep(5, 237))
+)
+
+# Read the frame image for each block
+get.blk <- function(blk){
+  if (blk == 1){readJPEG(paste0("~/queen_frames/queenX_",81,".jpg"))}
+  else if (blk == 2){readJPEG(paste0("~/queen_frames/queenX_",256,".jpg"))}
+  else if (blk == 3){readJPEG(paste0("~/queen_frames/queenX_",588,".jpg"))}
+  else if (blk == 4){readJPEG(paste0("~/queen_frames/queenX_",895,".jpg"))}
+  else {readJPEG(paste0("~/queen_frames/queenX_",1080,".jpg"))}
+}
+
+# Add Block information in the whole dataset
+Whole.data <- Whole.data %>% inner_join(BlockDef)
+PUP.data <- PUP.data %>% inner_join(BlockDef)
+```
+
+```{r get SACCADE data}
+SACC <- Whole.data %>% filter(IN_BLINK == 0, SACCADE_INDEX != 0) %>% 
+  group_by(SACCADE_INDEX, ID, TRIAL, GROUP, BLOCK) %>% 
+  summarise(START_TIME = min(TIMESTAMP), END_TIME =  max(TIMESTAMP),
+            SACC_DURATION = max(TIMESTAMP) - min(TIMESTAMP),
+            START_X = GAZE_X[1], START_Y = GAZE_Y[1],
+            END_X =GAZE_X[length(GAZE_X)], END_Y =GAZE_Y[length(GAZE_Y)],
+            SACC_CTR_X = END_X-START_X, SACC_CTR_Y = END_Y-START_Y,
+            SACC_DISTANCE = sqrt((SACC_CTR_X)^2+(SACC_CTR_Y)^2),
+            SACC_RADIAN = atan2(SACC_CTR_Y, SACC_CTR_X),
+            SACC_AVE_VELO = SACC_DISTANCE/SACC_DURATION, ) %>% 
+  mutate(new_radian = replace(SACC_RADIAN, SACC_RADIAN<0, SACC_RADIAN + 2*pi)) %>% 
+  filter(SACC_DISTANCE != 0)
+
+summary(SACC$SACC_DISTANCE) 
+sum(SACC$SACC_DISTANCE > 400) ##only 96 saccade distance more than 400 (total 2339 data), omit them
+sum(SACC$SACC_DISTANCE < 5) ##only 17 distance less than 5
+
+SaccStat <- SACC %>% group_by(ID, TRIAL) %>% 
+  summarise(Dur_MEAN = mean(SACC_DURATION), Dur_median = median(SACC_DURATION),
+            Dur_STD = sd(SACC_DURATION),Dur_SKEW = skewness(SACC_DURATION),
+            DIS_MEAN = mean(SACC_DISTANCE), DIS_median = median(SACC_DISTANCE),
+            DIS_STD = sd(SACC_DISTANCE),DIS_SKEW = skewness(SACC_DISTANCE), 
+            RAD_MEAN = mean(new_radian), RAD_median = median(new_radian),
+            RAD_STD = sd(new_radian), RAD_SKEW = skewness(new_radian), 
+            VELO_MEAN = mean(SACC_AVE_VELO), VELO_median = median(SACC_AVE_VELO),
+            VELO_STD = sd(SACC_AVE_VELO), VELO_SKEW = skewness(SACC_AVE_VELO))
+write.csv(SaccStat, file = "~/Desktop/FinalModel/Sacc_Statistics.csv", row.names = F, quote = F)
+```
+
+```{r get FIXATION data}
+FIX <- Whole.data %>% filter(IN_BLINK == 0, FIX_INDEX != 0) %>% 
+  group_by(FIX_INDEX, ID, GROUP, TRIAL, BLOCK) %>%
+  summarise(START_TIME = min(TIMESTAMP), END_TIME =  max(TIMESTAMP),
+            FIX_DURATION =  max(TIMESTAMP) - min(TIMESTAMP),
+            AVE_X = mean(GAZE_X), AVE_Y = mean(GAZE_Y))
+
+FixDur <- Whole.data %>% filter(IN_BLINK == 0, FIX_INDEX != 0) %>% 
+  group_by(ID, GROUP, TRIAL) %>% 
+  mutate(FIX_COUNT =  max(FIX_INDEX)) %>% 
+  group_by(FIX_INDEX, ID, TRIAL, FIX_COUNT,GROUP) %>%
+  summarise(FIX_DURATION = max(TIMESTAMP) - min(TIMESTAMP))
+FixDur %>% filter(TRIAL == 1)
+
+summary(FixDur$FIX_DURATION<40) ##define short fixation: FIX_DURATION < 120
+
+FixStat <- FixDur %>% group_by(ID, TRIAL, GROUP, FIX_COUNT) %>% 
+  summarize(Short_Fix = sum(FIX_DURATION<40), Shrt_Fix_Percen = Short_Fix/FIX_COUNT,
+            mean = mean(FIX_DURATION), median = median(FIX_DURATION), std = sd(FIX_DURATION),
+            skewness = skewness(FIX_DURATION), kurtosis = kurtosis(FIX_DURATION)) %>% unique()
+write.csv(FixStat, file = "~/Desktop/FinalModel/Fix_Statistics.csv", row.names = F, quote = F)
+```
+
+```{r Fix duration Histgram}
+ggplot(FIX, aes(FIX_DURATION, fill = factor(GROUP))) +
+  scale_fill_manual(values=c("red", "blue"))+
+  geom_histogram(alpha=0.5,binwidth = 50 , position = "identity") +
+  facet_wrap(~TRIAL, ncol = 2)+
+  labs(x = "Fixation Duration", y = "Count", fill = "Group") + 
+  theme(aspect.ratio=1/1)
+dev.copy(pdf, "FixDur_Hist.pdf")
+dev.off()
+```
+
+```{r Fix Intensity heatmap}
+GetIntensHeatMap <- function(trial, blk){
+  ggplot(Whole.data %>% filter(BLOCK == blk, TRIAL == trial),
+       aes(x = GAZE_X + 128, y = 768 - GAZE_Y - 24)) + 
+  background_image(get.blk(blk)) +
+  xlim(c(0, 1280)) + ylim(c(0,720)) +
+  facet_wrap(~GROUP, ncol = 2) +
+  labs(x = "x-axis (pixels)", y = "y-axis (pixels)") +
+  stat_density2d(aes(fill = ..level..), geom ="polygon") +
+  scale_fill_gradient(low="yellow", high="red") +
+  # theme(legend.position="none")+ 
+  coord_fixed() 
+}
+GetIntensHeatMap(0,1)
+dev.copy(pdf, "Heat_F_B1.pdf")
+dev.off()
+GetIntensHeatMap(1,1)
+dev.copy(pdf, "Heat_T_B1.pdf")
+dev.off()
+```
+
+```{r plot eye movement based on `BLOCK`}
+GetEyeMove <- function(id, trial, blk){
+  PlotFixData <- FIX %>% subset(ID == id & BLOCK == blk & TRIAL == trial)
+  PlotSaccData <- SACC %>% subset(ID == id & BLOCK == blk & TRIAL == trial)
+  frm <- get.blk(blk)
+  ggplot() +
+    background_image(frm) +
+    geom_segment(data = PlotSaccData, 
+                 aes(x = START_X + 128, y = 768 - START_Y - 24, xend = END_X + 128, yend = 768 - END_Y - 24),
+                 # arrow = arrow(length=unit(0.3,"cm")), size = 0.7, alpha = 0.7, color = factor(GROUP)) +
+                 arrow = arrow(length=unit(0.2,"cm")), size = 0.5, color = "blue") +
+    geom_point(data = PlotFixData,
+               aes(x = AVE_X + 128, y = 768 - AVE_Y - 24, size = FIX_DURATION),
+               # alpha = 0.7, color = factor(GROUP)) +
+               alpha = 0.7, color = "firebrick2") +
+    xlim(c(0, 1280)) + ylim(c(0,720)) +
+    # facet_wrap(~ID, ncol = 2) +
+    labs(x = "x-axis (pixels)", y = "y-axis (pixels)") +
+    coord_fixed() # Keeps aspect ratio from getting distorted
+}
+
+GetEyeMove(4,0,2)
+dev.copy(pdf, "Vector_F_ID4_B2.pdf")
+dev.off()
+```
+
+```{r plot GAZE_X,Y as time series}
+#### https://cran.r-project.org/web/packages/eyelinker/vignettes/basics.html
+# # Based on different blocks
+# GazeData <- Whole.data %>% select(TIMESTAMP, ID, TRIAL, GAZE_X, GAZE_Y, BLOCK) %>% 
+#   gather("Coord", "Pos", GAZE_X, GAZE_Y) %>% group_by(ID, TRIAL, BLOCK) %>% 
+#   mutate(ts = (TIMESTAMP - min(TIMESTAMP)) / 1e3) # let's have time in sec.
+# ggplot(filter(GazeData, ID == 1 & BLOCK == 4), aes(ts, Pos, col = Coord)) + geom_line() + facet_wrap(~TRIAL)
+
+# the whole video process
+GazeData <- Whole.data %>% select(TIMESTAMP, ID, TRIAL, GAZE_X, GAZE_Y) %>% 
+  gather("Coord", "Pos", GAZE_X, GAZE_Y) %>% group_by(ID, TRIAL) %>% 
+  mutate(ts = (TIMESTAMP - min(TIMESTAMP)) / 1e3) # let's have time in sec.
+# ggplot(filter(GazeData, ID == 1), aes(ts, Pos, col = Coord)) + geom_line() + facet_wrap(~TRIAL)
+ggplot(GazeData, aes(ts, Pos, col = Coord)) + geom_line() + facet_wrap(~TRIAL)
+```
+
+```{r plot SACCADE central map}
+GetSaccCtrMap <- function(trial, blk){
+  ggplot(SACC %>% filter(TRIAL == trial, BLOCK == blk, SACC_DISTANCE < 400), 
+         aes(color = factor(GROUP))) +
+  geom_segment(aes(x = 0, y = 0, xend = SACC_CTR_X, yend = SACC_CTR_Y),
+               arrow = arrow(length=unit(0.2,"cm")), size = 0.5, alpha = 0.7) +
+  facet_wrap(~ID, nrow = 2) +
+  coord_fixed()
+}
+GetSaccCtrMap(0,2)
+GetSaccCtrMap(1,2)
+
+GetSaccCtrMap(0,4)
+GetSaccCtrMap(1,4)
+```
+
+
+```{r Pupil in Fixation}
+PupSubstr <- Whole.data %>% filter(VELOCITY_X != 0, VELOCITY_Y != 0) %>% group_by(ID, TRIAL) %>% 
+  # mutate(PupBaseline = mean(PUPIL_SIZE),PupUnit = PUPIL_SIZE - PupBaseline)
+  mutate(TIME_INDEX = TIMESTAMP - min(TIMESTAMP)) %>% group_by(ID, TRIAL, BLOCK) %>%
+  mutate(PupBaseline = median(PUPIL_SIZE[5:55]), PupUnit = PUPIL_SIZE - PupBaseline) %>% 
+  filter(abs(PupUnit) < 500)
+# PupSubstr %>% group_by(ID, TRIAL, BLOCK) %>% slice(1) %>% select(ID, TRIAL, BLOCK, PupBaseline)
+
+PupChange <- PupSubstr %>% filter(FIX_INDEX != 0) %>% 
+  group_by(FIX_INDEX, ID, GROUP, TRIAL) %>% 
+  summarise(FIX_DURATION =  max(TIMESTAMP) - min(TIMESTAMP),
+            MAX_CHANGE_rate =  (max(PUPIL_SIZE) - min(PUPIL_SIZE))/ PupBaseline,
+            S_E_CHANGE = abs(PUPIL_SIZE[1] - PUPIL_SIZE[length(PUPIL_SIZE)])) %>% unique() 
+summary(PupChange$MAX_CHANGE_rate)
+
+ggplot(PupChange,aes(x = as.factor(ID), y = MAX_CHANGE_rate)) +
+  geom_boxplot(outlier.size = 0.5) +
+  facet_wrap(~TRIAL) +  
+  labs(x = "Subjects", y = "maximum change ratio of pupil size in each fixtion") + 
+  theme(aspect.ratio=1/1)
+dev.copy(pdf, "MaxChangPup_Box.pdf")
+dev.off()
+
+# PupDivs <- Whole.data %>% filter(PUPIL_SIZE != 0) %>% group_by(ID, TRIAL) %>% 
+#   # mutate(PupBaseline = mean(PUPIL_SIZE),PupUnit = PUPIL_SIZE - PupBaseline)
+#   mutate(TIME_INDEX = TIMESTAMP - min(TIMESTAMP)) %>% group_by(ID, TRIAL, BLOCK) %>%
+#   mutate(PupBaseline = median(PUPIL_SIZE[5:55]), PupUnit = PUPIL_SIZE/PupBaseline)
+
+ggplot(filter(PupSubstr, TRIAL == 1),
+       aes(x = TIME_INDEX, y = PupUnit, color = factor(GROUP))) +
+  geom_point(size = 0.2) +
+  facet_wrap(facets = vars(ID), nrow = 2) +
+  scale_color_brewer(type='qual', palette=6) + 
+  labs(x = "time", y = "united pupil size") +
+  theme(aspect.ratio=1/1, legend.position="none")
+```
+
+```{r Time Series in Pupil Size}
+################ Just drop all the blink data
+PupTS <- PupSubstr %>% group_by(ID, TRIAL, BLOCK) %>% mutate(obsevation = row_number(ID)) %>% 
+  select(ID, TRIAL, BLOCK, PupUnit, obsevation) %>% 
+  pivot_wider(id_cols = ID:TRIAL:BLOCK, names_from = obsevation, values_from = PupUnit)
+  # filter(BLOCK == 4) %>% mutate(Total_Obs = max(obsevation)) %>% slice(1)
+
+sample <- PupTS %>% filter(BLOCK == 2) %>% ungroup() %>%
+  select(-ID,-TRIAL,-BLOCK) %>% select(1:2700) %>% 
+  filter(row_number() != 15)
+# Hierarchical Clustering with DTW Distance
+myDist <- dist(sample, method="DTW")
+hc <- hclust(myDist, method="average")
+observedLabels <- c(rep(1,5), rep(2,5), rep(1,4), rep(2,5))
+# cut tree to get 2 clusters
+memb <- cutree(hc, k=2)
+table(observedLabels, memb)
+# accuracy
+(sum(observedLabels == memb))/nrow(Sample)
+
+# TimeLength <- c(20900, 21110, 21658, 21597, 20741, 21101, 20528, 11982, 20343, 9450,
+#                 19985, 14756, 20395, 20388, 19990, 19993, 19431, 20025, 20182, 19912)
+
+################ Smooth the time series by adding the 
+# Smooth the pupil size and use linear-spline interpolation for it
+smooth_interpolate_pupil<-function(data, pupil="pupil", hz=NA, n=NA) {
+  # Performing linear interpolation
+  smooth_pupil <- as.data.frame(data) %>%
+    mutate(movingavgpup = moving_average_pupil(PUPIL_SIZE, n = n))
+
+  pupil_interp <- smooth_pupil %>% group_by(ID, TRIAL, BLOCK) %>%
+    mutate(pup_interp = zoo::na.approx(movingavgpup, rule=2)) %>%
+    ungroup() %>% select(-movingavgpup)
+  return(pupil_interp)
+}
+blink_indicies <- which(Whole.data$VELOCITY_X == 0)
+PupSmooth <- Whole.data
+PupSmooth[blink_indicies,"PUPIL_SIZE"] <-  NA
+PupSmooth <- smooth_interpolate_pupil(PupSmooth, pupil = "PUPIL_SIZE", hz = 250, n = 5) %>%
+  group_by(ID, TRIAL) %>% mutate(TIME_INDEX = TIMESTAMP - min(TIMESTAMP)) %>%
+  group_by(ID, TRIAL, BLOCK) %>%
+  mutate(PupBaseline = median(pup_interp[5:55]), PupUnit = pup_interp - PupBaseline)
+
+PupSmoothTS <- PupSmooth %>% group_by(ID, TRIAL, BLOCK) %>% mutate(obsevation = row_number(ID)) %>% 
+  select(ID, TRIAL, BLOCK, PupUnit, obsevation) %>% 
+  pivot_wider(id_cols = ID:TRIAL:BLOCK, names_from = obsevation, values_from = PupUnit)
+  # filter(BLOCK == 4) %>% mutate(Total_Obs = max(obsevation)) %>% slice(1)
+
+# Based on Block, try Hierarchical Clustering
+Sample <- PupSmoothTS %>% filter(BLOCK == 5) %>% ungroup() %>%
+  select(-ID,-TRIAL,-BLOCK) %>% select(1:4000)
+# Hierarchical Clustering with DTW Distance
+myDist <- dist(Sample, method="DTW")
+hc <- hclust(myDist, method="average")
+observedLabels <- c(rep(1,5), rep(2,5), rep(1,5), rep(2,5))
+# cut tree to get 2 clusters
+memb <- cutree(hc, k=2)
+table(observedLabels, memb)
+# accuracy
+(sum(observedLabels == memb))/nrow(Sample)
+# plot(hc, labels = observedLabels, main = "")
+
+################ Try Decision Tree with Discrete Wavelet Transform(DWT)
+# extract DWT (with Haar filter) coefficients
+wtData <- NULL
+for (i in 1:nrow(Sample)) {
+  a <- t(Sample[i,])
+  wt <- dwt(a, filter="haar", boundary="periodic")
+  wtData <- rbind(wtData,unlist(c(wt@W, wt@V[[wt@level]])))
+}
+wtData <- as.data.frame(wtData)
+wtSamlpe <- data.frame(cbind(observedLabels, wtData))
+SampleSplt = sample.split(wtSamlpe$observedLabels, SplitRatio = .75)
+train = subset(wtSamlpe, SampleSplt == TRUE)
+test  = subset(wtSamlpe, SampleSplt == FALSE)
+# Deciosn Tree for classification
+ct <- ctree(observedLabels ~ ., data = train, 
+            controls = ctree_control(minsplit=20, minbucket=5, maxdepth=5))
+plot(ct)
+pClassId <- predict(ct, test)
+predProb = sapply(predict(ct, test, type="prob"))
+
+test$predClass2 = 0
+test$predClass2[test$predProb >= 0.2] = 1
+confusionMatrix(observedLabels,pClassId)
+table(observedLabels, pClassId)
+
+################ Just drop all the blink data
+PupTS <- PupSubstr %>% group_by(ID, TRIAL, BLOCK) %>% mutate(obsevation = row_number(ID)) %>% 
+  select(ID, TRIAL, BLOCK, PupUnit, obsevation) %>% 
+  pivot_wider(id_cols = ID:TRIAL:BLOCK, names_from = obsevation, values_from = PupUnit)
+  # filter(BLOCK == 4) %>% mutate(Total_Obs = max(obsevation)) %>% slice(1)
+
+sample <- PupTS %>% filter(BLOCK == 2) %>% ungroup() %>%
+  select(-ID,-TRIAL,-BLOCK) %>% select(1:2700) %>% 
+  filter(row_number() != 15)
+# Hierarchical Clustering with DTW Distance
+myDist <- dist(sample, method="DTW")
+hc <- hclust(myDist, method="average")
+observedLabels <- c(rep(1,5), rep(2,5), rep(1,4), rep(2,5))
+# cut tree to get 2 clusters
+memb <- cutree(hc, k=2)
+table(observedLabels, memb)
+# accuracy
+(sum(observedLabels == memb))/nrow(Sample)
+
+# TimeLength <- c(20900, 21110, 21658, 21597, 20741, 21101, 20528, 11982, 20343, 9450,
+#                 19985, 14756, 20395, 20388, 19990, 19993, 19431, 20025, 20182, 19912)
+
+################ Smooth the time series by adding the 
+# Smooth the pupil size and use linear-spline interpolation for it
+smooth_interpolate_pupil<-function(data, pupil="pupil", hz=NA, n=NA) {
+  # Performing linear interpolation
+  smooth_pupil <- as.data.frame(data) %>%
+    mutate(movingavgpup = moving_average_pupil(PUPIL_SIZE, n = n))
+
+  pupil_interp <- smooth_pupil %>% group_by(ID, TRIAL, BLOCK) %>%
+    mutate(pup_interp = zoo::na.approx(movingavgpup, rule=2)) %>%
+    ungroup() %>% select(-movingavgpup)
+  return(pupil_interp)
+}
+blink_indicies <- which(Whole.data$VELOCITY_X == 0)
+PupSmooth <- Whole.data
+PupSmooth[blink_indicies,"PUPIL_SIZE"] <-  NA
+PupSmooth <- smooth_interpolate_pupil(PupSmooth, pupil = "PUPIL_SIZE", hz = 250, n = 5) %>%
+  group_by(ID, TRIAL) %>% mutate(TIME_INDEX = TIMESTAMP - min(TIMESTAMP)) %>%
+  group_by(ID, TRIAL, BLOCK) %>%
+  mutate(PupBaseline = median(pup_interp[5:55]), PupUnit = pup_interp - PupBaseline)
+
+PupSmoothTS <- PupSmooth %>% group_by(ID, TRIAL, BLOCK) %>% mutate(obsevation = row_number(ID)) %>% 
+  select(ID, TRIAL, BLOCK, PupUnit, obsevation) %>% 
+  pivot_wider(id_cols = ID:TRIAL:BLOCK, names_from = obsevation, values_from = PupUnit)
+  # filter(BLOCK == 4) %>% mutate(Total_Obs = max(obsevation)) %>% slice(1)
+
+# Based on Block, try Hierarchical Clustering
+Sample <- PupSmoothTS %>% filter(BLOCK == 5) %>% ungroup() %>%
+  select(-ID,-TRIAL,-BLOCK) %>% select(1:4000)
+# Hierarchical Clustering with DTW Distance
+myDist <- dist(Sample, method="DTW")
+hc <- hclust(myDist, method="average")
+observedLabels <- c(rep(1,5), rep(2,5), rep(1,5), rep(2,5))
+# cut tree to get 2 clusters
+memb <- cutree(hc, k=2)
+table(observedLabels, memb)
+# accuracy
+(sum(observedLabels == memb))/nrow(Sample)
+# plot(hc, labels = observedLabels, main = "")
+
+################ Try Decision Tree with Discrete Wavelet Transform(DWT)
+# extract DWT (with Haar filter) coefficients
+wtData <- NULL
+for (i in 1:nrow(Sample)) {
+  a <- t(Sample[i,])
+  wt <- dwt(a, filter="haar", boundary="periodic")
+  wtData <- rbind(wtData,unlist(c(wt@W, wt@V[[wt@level]])))
+}
+wtData <- as.data.frame(wtData)
+wtSamlpe <- data.frame(cbind(observedLabels, wtData))
+SampleSplt = sample.split(wtSamlpe$observedLabels, SplitRatio = .75)
+train = subset(wtSamlpe, SampleSplt == TRUE)
+test  = subset(wtSamlpe, SampleSplt == FALSE)
+# Deciosn Tree for classification
+ct <- ctree(observedLabels ~ ., data = train, 
+            controls = ctree_control(minsplit=20, minbucket=5, maxdepth=5))
+plot(ct)
+pClassId <- predict(ct, test)
+predProb = sapply(predict(ct, test, type="prob"))
+
+test$predClass2 = 0
+test$predClass2[test$predProb >= 0.2] = 1
+confusionMatrix(observedLabels,pClassId)
+table(observedLabels, pClassId)
+```
+
+
+```{r add aoi}
+#####TRUE#######
+animate_aoi <- data.frame(Target = c("Queen","LeftMan","RightMan","FrontMan",
+                                     "BottomLeft","bottomRight","TopRight"),
+                          xmin = c(420,300,620,500,300,810,810),
+                          ymin = c(375,200,375,30,30,30,375),
+                          xmax = c(600,420,780,600,420,1080,1080),
+                          ymax = c(570,540,560,375,125,375,670))
+B2 <- Whole.data %>% filter(BLOCK==2)
+B4 <- Whole.data %>% filter(BLOCK==4)
+
+B4_AOI <- add_aoi(data = Whole.data, aoi_dataframe = animate_aoi, 
+               x_col = "GAZE_X", y_col = "GAZE_Y", 
+               aoi_name = "Animate",
+               x_min_col = "Left", x_max_col = "Right", y_min_col = "Top", y_max_col = "Bottom")
+
+assign_aoi(gaze = B4,aoi_loc = animate_aoi, X = "GAZE_X", Y = "GAZE_Y")
+```
+
+```{r Plot AOI for B4}
+animate_aoi <- data.frame(Target = c("Queen","LeftMan","RightMan","FrontMan",
+                                     "BottomLeft","bottomRight","TopRight"),
+                          xmin = c(420,280,620,500,280,810,810),
+                          ymin = c(375,190,375,0,0,0,375),
+                          xmax = c(600,420,780,700,420,1120,1120),
+                          ymax = c(580,550,575,375,125,375,690))
+B4_AOI <- B4 %>% filter(IN_BLINK == 0, SACCADE_INDEX != 0) %>% 
+  group_by(SACCADE_INDEX, ID, TRIAL, GROUP) %>% 
+  summarise(START_TIME = min(TIMESTAMP), END_TIME =  max(TIMESTAMP),
+            START_X = GAZE_X[1], START_Y = GAZE_Y[1],
+            END_X =GAZE_X[length(GAZE_X)], END_Y =GAZE_Y[length(GAZE_Y)])
+B4_AOI <- B4_AOI %>% filter(ID == 6 , TRIAL == 1)
+ggplot() +
+  background_image(get.blk(4)) +
+  geom_segment(data = animate_aoi, 
+               aes(x = xmin, y = ymin,
+                   xend = xmin, yend = ymax), 
+               size = 0.5, color = "blue") +
+  geom_segment(data = animate_aoi, 
+               aes(x = xmax, y = ymin, 
+                   xend = xmax, yend = ymax), 
+               size = 0.5, color = "blue") +
+  geom_segment(data = animate_aoi, 
+               aes(x = xmin, y = ymin, 
+                   xend = xmax, yend = ymin), 
+               size = 0.5, color = "blue") +
+  geom_segment(data = animate_aoi, 
+               aes(x = xmin, y = ymax, 
+                   xend = xmax, yend = ymax), 
+               size = 0.5, color = "blue") +
+  geom_segment(data = B4_AOI, 
+                 aes(x = START_X + 128, y = 768 - START_Y - 24, 
+                     xend = END_X + 128, yend = 768 - END_Y - 24),
+                 arrow = arrow(length=unit(0.2,"cm")), size = 0.5, color = "blue") +
+    xlim(c(0, 1280)) + ylim(c(0,720)) +
+    labs(x = "x-axis (pixels)", y = "y-axis (pixels)") +
+    coord_fixed() # Keeps aspect ratio from getting distorted
+```
+
+```{r saccade velocity logistic regressoin}
+data <- Whole.data %>% filter(SACCADE_INDEX != 0, IN_BLINK == 0) %>% 
+  group_by(ID,TRIAL,GROUP,SACCADE_INDEX) %>% 
+  summarise(SACC_DURATION =  max(TIMESTAMP) - min(TIMESTAMP),
+            START_X = GAZE_X[1], START_Y = GAZE_Y[1],
+            END_X =GAZE_X[length(GAZE_X)], END_Y =GAZE_Y[length(GAZE_Y)],
+            SACC_CTR_X = END_X-START_X, SACC_CTR_Y = END_Y-START_Y,
+            SACC_DISTANCE = sqrt((SACC_CTR_X)^2+(SACC_CTR_Y)^2),
+            SACC_RADIAN = atan2(SACC_CTR_Y, SACC_CTR_X),
+            # SACC_AVE_VELO = SACC_DISTANCE/SACC_DURATION,
+            SACC_AVE_VELO = mean(sqrt((VELOCITY_X)^2+(VELOCITY_Y)^2)),
+            AVE_VEL_X = mean(abs(VELOCITY_X)), AVE_VEL_Y = mean(abs(VELOCITY_Y)),
+            PEAK_VEL_X = max(abs(VELOCITY_X)), PEAK_VEL_Y = max(abs(VELOCITY_Y)))
+data$GROUP <- as.factor(data$GROUP)
+
+set.seed(111)
+sample = sample.split(data$GROUP, SplitRatio = .75)
+train = subset(data, sample == TRUE)
+test = subset(data, sample == FALSE)
+
+fit1 <- glm(GROUP ~ SACC_DURATION + AVE_VEL_X + AVE_VEL_Y + PEAK_VEL_X + PEAK_VEL_Y + SACC_RADIAN,
+             family = binomial(link = logit), data = train)
+prob1 = predict(fit1, test, type = "response")
+pred1 = prediction(prob1, test$GROUP)
+summary(fit1)
+# auc(roc(prob2, test$GROUP))
+
+fit2 <- glm(GROUP ~ AVE_VEL_X + PEAK_VEL_X,
+             family = binomial(link = logit), data = train)
+prob2 = predict(fit2, test, type = "response")
+pred2 = prediction(prob2, test$GROUP)
+summary(fit2)
+anova(fit2,fit1, test="LRT")
+
+pred = predict(fit2, test, type = "response")
+predicted.classes <- ifelse(pred > 0.5, 2, 1)
+mean(predicted.classes == test$GROUP) #The classification prediction accuracy is about 62%
+
+fit3 <- glm(GROUP ~ SACC_DURATION + SACC_RADIAN + SACC_AVE_VELO + SACC_DISTANCE,
+             family = binomial(link = logit), data = train)
+prob3 = predict(fit3, test, type = "response")
+pred3 = prediction(prob3, test$GROUP)
+summary(fit3)
+
+
+auc1 <- round(performance(pred1, "auc")@y.values[[1]],3)
+auc2 <- round(performance(pred2, "auc")@y.values[[1]],3)
+auc3 <- round(performance(pred3, "auc")@y.values[[1]],3)
+# auc4 <- round(performance(pred4, "auc")@y.values[[1]],3)
+plot(performance(pred1, "tpr", "fpr"), col="2", main = "ROC Curves")
+plot(performance(pred2, "tpr", "fpr"), add = T, col="3")
+plot(performance(pred3, "tpr", "fpr"), add = T, col="4")
+# plot(performance(pred4, "tpr", "fpr"), add = T, col="5")
+abline(a = 0, b = 1, lty = 2, col = "grey")
+legend(0.6, 0.37 ,legend = c(paste("model1: AUC = ", auc1, sep = ' '),
+                           paste("model2: AUC = ", auc2, sep = ' '),
+                           paste("model3: AUC = ", auc3, sep = ' ')), fill = 2:4)
+                           # paste("model4: AUC = ", auc4, sep = ' ')), fill = 2:5)
+# dev.copy(pdf,"LogisticRegression.pdf")
+# dev.off
+
+
+fit1.aic=step(fit1,trace=0)
+summary(fit1.aic)
+n=length(train[,"GROUP"])
+fit1.bic=step(fit1,k=log(n),trace=0)
+summary(fit1.bic)
+
+fit2.aic=step(fit2,trace=0)
+summary(fit2.aic)
+n=length(train[,"GROUP"])
+fit2.bic=step(fit2,k=log(n),trace=0)
+summary(fit2.bic)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
